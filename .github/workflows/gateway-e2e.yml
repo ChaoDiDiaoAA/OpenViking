@@ -21,7 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 65
     env:
-      OV_TEST_KIND_KUBECONFIG: ${{ runner.temp }}/kubeconfig
       OV_TEST_GATEWAY_IMAGE: ghcr.io/volcengine/openviking:main
     steps:
       - uses: actions/checkout@v4
@@ -39,6 +38,7 @@ jobs:
           node-version: "22"
       - name: Install test clients and kind
         run: |
+          echo "OV_TEST_KIND_KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
           pip install pytest httpx openai==3.37.0 anthropic==2.2.0
           npm install --global @openai/codex@0.146.0
           curl -fsSL https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64 -o /usr/local/bin/kind
