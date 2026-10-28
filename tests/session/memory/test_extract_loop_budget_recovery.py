@@ -112,9 +112,9 @@ def _make_loop(vlm, **kwargs):
     )
 
 
-async def _run_loop(loop):
+async def _run_loop(loop, output_format="python"):
     config = SimpleNamespace(
-        memory=SimpleNamespace(link_enabled=False, extraction_output_format="python")
+        memory=SimpleNamespace(link_enabled=False, extraction_output_format=output_format)
     )
     with (
         patch(
@@ -218,9 +218,7 @@ class TestTruncationDetection:
     async def test_length_finish_reason_is_terminal_even_when_program_parses(self):
         """A truncated program that still parses must NOT be accepted as
         operations — trailing writes/deletes would be silently lost."""
-        vlm = ScriptedVLM(
-            [_length_response(content="sdk.commit()  # actually truncated upstream")]
-        )
+        vlm = ScriptedVLM([_length_response(content="sdk.commit()  # actually truncated upstream")])
         loop = _make_loop(vlm)
 
         with pytest.raises(RuntimeError, match="output-token budget"):
@@ -255,9 +253,7 @@ class TestTruncationDetection:
         raw = SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(
-                        content=_TRUNCATED_PROGRAM, tool_calls=None
-                    ),
+                    message=SimpleNamespace(content=_TRUNCATED_PROGRAM, tool_calls=None),
                     finish_reason="length",
                 )
             ],
@@ -283,15 +279,73 @@ class TestTruncationDetection:
             await _run_loop(loop)
 
 
+class TestJsonSchemaEcho:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "content",
+        [
+            '{"$defs": {"CasesDataPeer": {"type": "object", "properties": {"page_id":',
+            '```json\n{"$defs": {"CasesDataPeer": {"type": "object"}}}',
+            '{"type": "object", "properties": {"preferences": {"type": "array"}}}',
+        ],
+    )
+    async def test_truncated_schema_echo_fails_with_format_diagnosis(self, content):
+        vlm = ScriptedVLM([_length_response(content=content)])
+        loop = _make_loop(vlm)
+
+        with pytest.raises(RuntimeError, match="schema_echo") as exc_info:
+            await _run_loop(loop, output_format="json")
+
+        message = str(exc_info.value)
+        assert "extraction_output_format" in message
+        assert "Raise vlm.max_tokens" not in message
+        assert "finish_reason='length'" in message
+        assert len(vlm.calls) == 1
+        assert vlm.calls[0]["max_tokens"] == _DEFAULT_CAP
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("output_format", "content"),
+        [
+            ("json", '{"preferences": [{"content": "{\\"$defs\\": {}}"}]}'),
+            ("json", '{"$defs": {}, "preferences": []}'),
+            ("python", '{"$defs": {"CasesDataPeer": {"type": "object"}}}'),
+        ],
+    )
+    async def test_operations_and_python_output_keep_budget_diagnosis(self, output_format, content):
+        vlm = ScriptedVLM([_length_response(content=content)])
+        loop = _make_loop(vlm)
+
+        with pytest.raises(RuntimeError, match="output-token budget"):
+            await _run_loop(loop, output_format=output_format)
+
+        assert len(vlm.calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_complete_schema_echo_keeps_existing_format_retry(self):
+        vlm = ScriptedVLM(
+            [
+                VLMResponse(content='{"$defs": {"CasesDataPeer": {"type": "object"}}}'),
+                VLMResponse(content='{"preferences": []}'),
+            ]
+        )
+        loop = _make_loop(vlm)
+
+        operations, _ = await _run_loop(loop, output_format="json")
+
+        assert operations is not None
+        assert operations.upsert_operations == []
+        assert len(vlm.calls) == 2
+        assert _assistant_contents(vlm.calls[1]["messages"]) == []
+
+
 class TestNoTokenCounterInference:
     @pytest.mark.asyncio
     async def test_stop_at_cap_is_not_truncation(self):
         """finish_reason='stop' that lands exactly on the cap is a complete
         response, not budget exhaustion: an ordinary format error gets the
         regular single retry with the cap unchanged and no assistant replay."""
-        vlm = ScriptedVLM(
-            [_length_response(finish_reason="stop"), "sdk.commit()"]
-        )
+        vlm = ScriptedVLM([_length_response(finish_reason="stop"), "sdk.commit()"])
         loop = _make_loop(vlm)
 
         operations, _tools = await _run_loop(loop)
@@ -348,7 +402,9 @@ class TestExtractionContentBoundary:
     async def test_tool_call_respects_finish_reason(self, finish_reason):
         response = VLMResponse(
             content="<think>planning</think>I will read the file.",
-            tool_calls=[ToolCall(id="read-1", name="read", arguments={"uri": "viking://user/test"})],
+            tool_calls=[
+                ToolCall(id="read-1", name="read", arguments={"uri": "viking://user/test"})
+            ],
             finish_reason=finish_reason,
         )
         vlm = ScriptedVLM([response, VLMResponse(content="<think>done</think>sdk.commit()")])

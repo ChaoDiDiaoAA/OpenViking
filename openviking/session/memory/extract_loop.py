@@ -40,7 +40,7 @@ from openviking.session.memory.merge_op import (
 from openviking.session.memory.page_id_map import ResponsePageIdAllocator
 from openviking.session.memory.schema_model_generator import SchemaModelGenerator
 from openviking.session.memory.tools import MEMORY_TOOLS_REGISTRY
-from openviking.session.memory.utils.json_parser import JsonUtils
+from openviking.session.memory.utils.json_parser import JsonUtils, parse_json_with_stability
 from openviking.session.memory.utils.uri import generate_uri
 from openviking.storage.viking_fs import VikingFS, get_viking_fs
 from openviking.telemetry import bind_telemetry_stage, tracer
@@ -404,21 +404,17 @@ class ExtractLoop:
             parse_error = self._last_parse_error
             # Add format error message if parse failed (max 1 retry). This may raise
             # max_iterations, granting one more attempt after this failure.
-            if failure_kind == "budget_exhausted":
+            if failure_kind in {"budget_exhausted", "schema_echo"}:
                 # Truncation is not an ordinary format mistake: a same-cap format
                 # retry would only hit the budget again, and replaying the
                 # truncated output just grows the prompt. Fail fast with the
                 # dedicated error recorded by _call_llm().
-                raise RuntimeError(
-                    f"Memory extraction aborted: {parse_error or failure_kind}"
-                )
+                raise RuntimeError(f"Memory extraction aborted: {parse_error or failure_kind}")
 
             if self._format_retry_count == 0:
                 self._format_retry_count += 1
                 max_iterations += 1
-                retry_reason = (
-                    "refusal_text" if failure_kind == "refusal_text" else "format_retry"
-                )
+                retry_reason = "refusal_text" if failure_kind == "refusal_text" else "format_retry"
                 tracer.info(f"Extended max_iterations to {max_iterations} for {retry_reason}")
                 self._add_format_error_message(messages)
 
@@ -492,20 +488,39 @@ class ExtractLoop:
             configured if configured is not None else _DEFAULT_EXTRACTION_MAX_OUTPUT_TOKENS
         )
 
-    def _budget_exhausted_error(self, response: Any, content: str) -> str:
-        """Build the dedicated, actionable error for a truncated response.
+    def _classify_truncated_response(self, response: Any, content: str) -> Tuple[str, str]:
+        """Classify explicit truncation and build its actionable error.
 
         Truncation is detected only from the backend's explicit
         ``finish_reason == "length"``; token counters are never used to infer it.
         """
         usage = getattr(response, "usage", None)
         completion_tokens = usage.get("completion_tokens") if isinstance(usage, dict) else None
-        details = (
-            f"finish_reason='length', output cap={self._effective_max_output_tokens} tokens"
-        )
+        details = f"finish_reason='length', output cap={self._effective_max_output_tokens} tokens"
         if completion_tokens:
             details += f", completion_tokens={completion_tokens}"
-        return (
+        if (
+            self._output_protocol is not None
+            and self._output_protocol.name == "json"
+            and self._operations_model is not None
+        ):
+            # Repair only for diagnosis; truncated operations are never accepted.
+            value, _ = parse_json_with_stability(VLMBase._clean_response(content))
+            if (
+                isinstance(value, dict)
+                and not value.keys() & self._operations_model.model_fields.keys()
+                and (
+                    isinstance(value.get("$defs"), dict)
+                    or (value.get("type") == "object" and isinstance(value.get("properties"), dict))
+                )
+            ):
+                return "schema_echo", (
+                    "JSON Schema echoed instead of memory operations (failure_kind=schema_echo; "
+                    f"{details}), response_preview={_preview_text(content)!r}. "
+                    "Check the model's JSON extraction support or set "
+                    "memory.extraction_output_format='python' before retrying."
+                )
+        return "budget_exhausted", (
             "Response was cut off by the output-token budget "
             f"({details}), response_preview={_preview_text(content)!r}. "
             "Raise vlm.max_tokens in ov.conf or reduce the memory context before retrying."
@@ -1272,16 +1287,17 @@ class ExtractLoop:
 
         # Reject explicit truncation before handling tool calls or parsing:
         # neither a partial tool call nor a parseable program is safe to use.
-        # run() treats budget_exhausted as terminal, without a format retry.
+        # run() treats truncation as terminal, without a format retry.
         if getattr(response, "finish_reason", None) == "length":
             content = getattr(response, "content", None) or ""
-            self._last_llm_failure_kind = "budget_exhausted"
+            self._last_llm_failure_kind, self._last_parse_error = self._classify_truncated_response(
+                response, content
+            )
             self._last_llm_failure_content = content
-            self._last_parse_error = self._budget_exhausted_error(response, content)
             tracer.set("memory.extraction.parse_error", self._last_parse_error)
             logger.debug(
-                "Response truncated by output-token budget "
-                f"failure_kind=budget_exhausted error={self._last_parse_error}"
+                "Truncated memory extraction response "
+                f"failure_kind={self._last_llm_failure_kind} error={self._last_parse_error}"
             )
             return (None, None)
 
