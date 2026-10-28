@@ -48,13 +48,99 @@ jobs:
           mkdir -p artifacts
       - name: Create dedicated three-node cluster
         run: kind create cluster --name ovgw-e2e --config tests/gateway/e2e/kind.yaml --kubeconfig "$OV_TEST_KIND_KUBECONFIG" --wait 120s
-      - name: Build source overlay for a manual run
+      - name: Capture runner baseline
         if: github.event_name == 'workflow_dispatch' && inputs.overlay
+        shell: bash
+        run: |
+          command -v timeout setsid
+          diag="$RUNNER_TEMP/ovgw-runner-diagnostics"
+          mkdir -p "$diag"
+          cat > "$diag/snapshot.sh" <<'SNAPSHOT'
+          #!/usr/bin/env bash
+          set -u
+          probe() {
+            printf '\nprobe:'; printf ' %q' "$@"; printf '\n'
+            timeout --kill-after=1s 5s "$@"
+            printf 'probe_exit=%s\n' "$?"
+          }
+          printf 'utc=%s\n' "$(date -u +%FT%TZ)"
+          docker_root=$(cat "${BASH_SOURCE[0]%/*}/docker-root.txt")
+          probe grep -E '^(MemAvailable|SwapFree):' /proc/meminfo
+          probe cat /proc/loadavg
+          for resource in cpu memory io; do probe cat "/proc/pressure/$resource"; done
+          probe grep '^oom_kill ' /proc/vmstat
+          probe df -Pk -- / "$RUNNER_TEMP" "$GITHUB_WORKSPACE" "${docker_root:-/}"
+          probe df -Pi -- / "$RUNNER_TEMP" "$GITHUB_WORKSPACE" "${docker_root:-/}"
+          probe ps -C Runner.Listener,Runner.Worker,dockerd,containerd,buildkitd -o pid,comm,rss,stat,pcpu
+          if [[ ${1:-} == full ]]; then
+            printf 'ImageOS=%s\nImageVersion=%s\n' "${ImageOS:-unavailable}" "${ImageVersion:-unavailable}"
+            probe uname -r
+            probe nproc
+            probe docker version --format '{{.Client.Version}} {{.Server.Version}}'
+            probe docker buildx version
+            probe docker info --format 'driver={{.Driver}} root={{.DockerRootDir}}'
+            probe docker stats --no-stream --format '{{.Name}} CPU={{.CPUPerc}} memory={{.MemUsage}}' ovgw-e2e-control-plane ovgw-e2e-worker ovgw-e2e-worker2
+            probe bash -o pipefail -c "dmesg --ctime | grep -Ei 'out of memory|killed process|oom|I/O error|no space left'"
+          fi
+          SNAPSHOT
+          root_status=0
+          timeout --kill-after=1s 5s docker info --format '{{.DockerRootDir}}' > "$diag/docker-root.txt" 2> "$diag/docker-root-probe.txt" || root_status=$?
+          printf 'docker_root_probe_exit=%s\n' "$root_status" > "$diag/runner-baseline.txt"
+          cat "$diag/docker-root-probe.txt" >> "$diag/runner-baseline.txt"
+          bash "$diag/snapshot.sh" full >> "$diag/runner-baseline.txt" 2>&1
+          cat "$diag/runner-baseline.txt"
+      - name: Upload runner baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.overlay
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ovgw-runner-diagnostics/runner-baseline.txt
+          if-no-files-found: error
+      - name: Build source overlay for a manual run
+        id: overlay_build
+        if: github.event_name == 'workflow_dispatch' && inputs.overlay
+        shell: bash
         env:
           BASE_REF: ${{ inputs.base_ref }}
         run: |
-          python tests/gateway/e2e/build_overlay.py ${BASE_REF:+--base-ref "$BASE_REF"} --tag ovgw-e2e:local
+          diag="$RUNNER_TEMP/ovgw-runner-diagnostics"
+          snapshot="$diag/snapshot.sh"
+          bash "$snapshot" 2>&1 | tee "$diag/runner-health.log"
+          setsid bash -c 'while sleep 30; do bash "$1"; done | tee -a "$2"' runner-sampler "$snapshot" "$diag/runner-health.log" &
+          sampler=$!
+          cleanup() {
+            kill "$sampler" 2>/dev/null || true
+            kill -- "-$sampler" 2>/dev/null || true
+            wait "$sampler" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          trap 'exit 143' TERM
+          trap 'exit 130' INT
+          set +e
+          timeout --verbose --signal=TERM --kill-after=30s 10m python tests/gateway/e2e/build_overlay.py ${BASE_REF:+--base-ref "$BASE_REF"} --tag ovgw-e2e:local 2>&1 | tee "$diag/overlay-build.log"
+          statuses=("${PIPESTATUS[@]}")
+          cleanup
+          trap - EXIT
+          bash "$snapshot" full > "$diag/runner-after.txt" 2>&1
+          after_status=$?
+          cat "$diag/runner-after.txt"
+          printf 'build_exit=%s\nlog_exit=%s\nsnapshot_exit=%s\n' "${statuses[0]}" "${statuses[1]}" "$after_status" | tee "$diag/build-exit.txt"
+          metadata_status=$?
+          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
+          if (( statuses[1] != 0 )); then exit "${statuses[1]}"; fi
+          if (( after_status != 0 )); then exit "$after_status"; fi
+          if (( metadata_status != 0 )); then exit "$metadata_status"; fi
           echo 'OV_TEST_GATEWAY_IMAGE=ovgw-e2e:local' >> "$GITHUB_ENV"
+      - name: Upload runner build diagnostics
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.overlay && steps.overlay_build.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-build-diag-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ovgw-runner-diagnostics/*.log
+            ${{ runner.temp }}/ovgw-runner-diagnostics/build-exit.txt
+            ${{ runner.temp }}/ovgw-runner-diagnostics/runner-after.txt
+          if-no-files-found: error
       - name: Load test images
         run: |
           docker image inspect "$OV_TEST_GATEWAY_IMAGE" >/dev/null 2>&1 || docker pull "$OV_TEST_GATEWAY_IMAGE"
