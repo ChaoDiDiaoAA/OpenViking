@@ -5,15 +5,17 @@ on:
   workflow_dispatch:
     inputs:
       ref:
-        description: "Git ref to test (empty uses the selected workflow ref)"
-        required: false
+        description: "Source commit for the A/B diagnostic"
+        required: true
+        default: c667b57b40d56e704241dc7400e332e7e0f77b55
       overlay:
         description: "Build the selected ref over the release image"
         type: boolean
         default: true
       base_ref:
-        description: "Release tag of the overlay base image (empty uses build_overlay.py's default)"
-        required: false
+        description: "Release tag for the A/B diagnostic"
+        required: true
+        default: v0.5.2
 permissions:
   contents: read
 jobs:
@@ -27,6 +29,20 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.ref }}
           fetch-depth: 0
+      - name: Verify diagnostic inputs
+        id: diagnostic_inputs
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          TEST_REF: ${{ inputs.ref }}
+          BASE_REF: ${{ inputs.base_ref }}
+          OVERLAY: ${{ inputs.overlay }}
+        run: |
+          if [[ "$TEST_REF" != c667b57b40d56e704241dc7400e332e7e0f77b55 || "$BASE_REF" != v0.5.2 || "$OVERLAY" != true ]]; then
+            echo 'This diagnostic requires ref=c667b57b4, overlay=true and base_ref=v0.5.2' >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "$TEST_REF"
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
@@ -89,24 +105,40 @@ jobs:
           cat "$diag/docker-root-probe.txt" >> "$diag/runner-baseline.txt"
           bash "$diag/snapshot.sh" full >> "$diag/runner-baseline.txt" 2>&1
           cat "$diag/runner-baseline.txt"
-      - name: Upload runner baseline
-        if: github.event_name == 'workflow_dispatch' && inputs.overlay
-        uses: actions/upload-artifact@v4
-        with:
-          name: runner-baseline-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/ovgw-runner-diagnostics/runner-baseline.txt
-          if-no-files-found: error
-      - name: Build source overlay for a manual run
-        id: overlay_build
-        if: github.event_name == 'workflow_dispatch' && inputs.overlay
-        shell: bash
-        env:
-          BASE_REF: ${{ inputs.base_ref }}
-        run: |
+          cat > "$diag/run-overlay.sh" <<'BUILD'
+          #!/usr/bin/env bash
+          set -euo pipefail
+          phase=$1
+          case "$phase" in
+            no-export) no_load=1 ;;
+            export) no_load=0 ;;
+            *) exit 2 ;;
+          esac
           diag="$RUNNER_TEMP/ovgw-runner-diagnostics"
           snapshot="$diag/snapshot.sh"
-          bash "$snapshot" 2>&1 | tee "$diag/runner-health.log"
-          setsid bash -c 'while sleep 30; do bash "$1"; done | tee -a "$2"' runner-sampler "$snapshot" "$diag/runner-health.log" &
+          image_absent() {
+            local image
+            image=$(timeout --kill-after=1s 5s docker image ls --format '{{.Repository}}:{{.Tag}}' ovgw-e2e:local) || return "$?"
+            if [[ -n "$image" ]]; then
+              echo 'Expected ovgw-e2e:local to be absent during phase A' >&2
+              return 1
+            fi
+          }
+          run_build() {
+            if [[ "$phase" == no-export ]]; then image_absent || return "$?"; fi
+            env BUILDX_NO_DEFAULT_LOAD="$no_load" BUILDKIT_PROGRESS=plain timeout --verbose --signal=TERM --kill-after=30s 10m python tests/gateway/e2e/build_overlay.py --base-ref "$BASE_REF" --tag ovgw-e2e:local
+            build_status=$?
+            printf 'build_exit=%s\n' "$build_status"
+            if (( build_status != 0 )); then return "$build_status"; fi
+            if [[ "$phase" == no-export ]]; then
+              image_absent
+            else
+              timeout --kill-after=1s 5s docker image inspect --format '{{.Os}}/{{.Architecture}}' ovgw-e2e:local || return "$?"
+              timeout --kill-after=1s 30s docker run --rm --network none --entrypoint python ovgw-e2e:local -I -c "import redis; from openviking_gateway.config import GatewayConfig; assert 'storage' in GatewayConfig.model_fields; from pathlib import Path; import openviking_gateway; assert list((Path(openviking_gateway.__file__).parent / 'lua').glob('*.lua'))"
+            fi
+          }
+          bash "$snapshot" 2>&1 | tee "$diag/$phase-health.log"
+          setsid bash -c 'while sleep 30; do bash "$1"; done | tee -a "$2"' runner-sampler "$snapshot" "$diag/$phase-health.log" &
           sampler=$!
           cleanup() {
             kill "$sampler" 2>/dev/null || true
@@ -117,44 +149,90 @@ jobs:
           trap 'exit 143' TERM
           trap 'exit 130' INT
           set +e
-          timeout --verbose --signal=TERM --kill-after=30s 10m python tests/gateway/e2e/build_overlay.py ${BASE_REF:+--base-ref "$BASE_REF"} --tag ovgw-e2e:local 2>&1 | tee "$diag/overlay-build.log"
+          run_build 2>&1 | tee "$diag/$phase-build.log"
           statuses=("${PIPESTATUS[@]}")
           cleanup
           trap - EXIT
-          bash "$snapshot" full > "$diag/runner-after.txt" 2>&1
+          phase_status=${statuses[0]}
+          if (( phase_status == 0 && statuses[1] == 0 )) && [[ "$phase" == no-export ]]; then
+            grep -Eq '^#[0-9]+ exporting (to image|layers)([[:space:]]|$)' "$diag/$phase-build.log"
+            export_status=$?
+            if (( export_status == 0 )); then
+              echo 'Phase A unexpectedly entered the image exporter' >&2
+              phase_status=1
+            elif (( export_status != 1 )); then
+              phase_status=$export_status
+            fi
+          fi
+          bash "$snapshot" full > "$diag/$phase-after.txt" 2>&1
           after_status=$?
-          cat "$diag/runner-after.txt"
-          printf 'build_exit=%s\nlog_exit=%s\nsnapshot_exit=%s\n' "${statuses[0]}" "${statuses[1]}" "$after_status" | tee "$diag/build-exit.txt"
+          cat "$diag/$phase-after.txt"
+          if (( phase_status == 0 && statuses[1] != 0 )); then phase_status=${statuses[1]}; fi
+          if (( phase_status == 0 && after_status != 0 )); then phase_status=$after_status; fi
+          printf 'phase_exit=%s\nlog_exit=%s\nsnapshot_exit=%s\n' "$phase_status" "${statuses[1]}" "$after_status" | tee "$diag/$phase-exit.txt"
           metadata_status=$?
-          if (( statuses[0] != 0 )); then exit "${statuses[0]}"; fi
-          if (( statuses[1] != 0 )); then exit "${statuses[1]}"; fi
-          if (( after_status != 0 )); then exit "$after_status"; fi
-          if (( metadata_status != 0 )); then exit "$metadata_status"; fi
-          echo 'OV_TEST_GATEWAY_IMAGE=ovgw-e2e:local' >> "$GITHUB_ENV"
-      - name: Upload runner build diagnostics
-        if: always() && github.event_name == 'workflow_dispatch' && inputs.overlay && steps.overlay_build.outcome != 'skipped'
+          if (( phase_status != 0 )); then exit "$phase_status"; fi
+          exit "$metadata_status"
+          BUILD
+      - name: Upload runner baseline
+        if: github.event_name == 'workflow_dispatch' && inputs.overlay
         uses: actions/upload-artifact@v4
         with:
-          name: runner-build-diag-${{ github.run_id }}-${{ github.run_attempt }}
+          name: runner-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/ovgw-runner-diagnostics/runner-baseline.txt
+          if-no-files-found: error
+      - name: Phase A - build without image export
+        id: phase_a
+        if: github.event_name == 'workflow_dispatch' && inputs.overlay
+        shell: bash
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+        run: bash "$RUNNER_TEMP/ovgw-runner-diagnostics/run-overlay.sh" no-export
+      - name: Preserve phase A evidence before export
+        id: upload_phase_a
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.overlay && steps.phase_a.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-no-export-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
-            ${{ runner.temp }}/ovgw-runner-diagnostics/*.log
-            ${{ runner.temp }}/ovgw-runner-diagnostics/build-exit.txt
-            ${{ runner.temp }}/ovgw-runner-diagnostics/runner-after.txt
+            ${{ runner.temp }}/ovgw-runner-diagnostics/no-export-*.log
+            ${{ runner.temp }}/ovgw-runner-diagnostics/no-export-*.txt
+          if-no-files-found: error
+      - name: Phase B - export the cached overlay
+        id: phase_b
+        if: >-
+          success() && github.event_name == 'workflow_dispatch' && inputs.overlay
+          && steps.phase_a.outcome == 'success' && steps.upload_phase_a.outcome == 'success'
+        shell: bash
+        env:
+          BASE_REF: ${{ inputs.base_ref }}
+        run: bash "$RUNNER_TEMP/ovgw-runner-diagnostics/run-overlay.sh" export
+      - name: Preserve phase B evidence
+        id: upload_phase_b
+        if: always() && github.event_name == 'workflow_dispatch' && inputs.overlay && steps.phase_b.outcome != 'skipped'
+        uses: actions/upload-artifact@v4
+        with:
+          name: runner-export-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ovgw-runner-diagnostics/export-*.log
+            ${{ runner.temp }}/ovgw-runner-diagnostics/export-*.txt
           if-no-files-found: error
       - name: Load test images
+        if: github.event_name != 'workflow_dispatch'
         run: |
           docker image inspect "$OV_TEST_GATEWAY_IMAGE" >/dev/null 2>&1 || docker pull "$OV_TEST_GATEWAY_IMAGE"
           docker pull redis:7.2-alpine
           python tests/gateway/e2e/load_images.py --cluster ovgw-e2e "$OV_TEST_GATEWAY_IMAGE" redis:7.2-alpine
       - name: Run standalone and Cluster matrices
+        if: github.event_name != 'workflow_dispatch'
         run: pytest tests/gateway/e2e --confcutdir=tests/gateway/e2e -o addopts='' -v --basetemp=artifacts/pytest --junitxml=artifacts/results.xml
       - name: Collect cluster evidence
-        if: always()
+        if: always() && github.event_name != 'workflow_dispatch'
         run: |
           kind export logs artifacts/kind --name ovgw-e2e || true
           kubectl --kubeconfig "$OV_TEST_KIND_KUBECONFIG" get pods -A -o wide > artifacts/pods.txt || true
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && github.event_name != 'workflow_dispatch'
         with:
           name: gateway-kind-evidence
           path: artifacts
