@@ -71,6 +71,7 @@ jobs:
           command -v timeout setsid
           diag="$RUNNER_TEMP/ovgw-runner-diagnostics"
           mkdir -p "$diag"
+          git show "${GITHUB_SHA}:tests/gateway/e2e/build_overlay.py" > "$diag/build_overlay.py"
           cat > "$diag/snapshot.sh" <<'SNAPSHOT'
           #!/usr/bin/env bash
           set -u
@@ -126,7 +127,7 @@ jobs:
           }
           run_build() {
             if [[ "$phase" == no-export ]]; then image_absent || return "$?"; fi
-            env BUILDX_NO_DEFAULT_LOAD="$no_load" BUILDKIT_PROGRESS=plain timeout --verbose --signal=TERM --kill-after=30s 10m python tests/gateway/e2e/build_overlay.py --base-ref "$BASE_REF" --tag ovgw-e2e:local
+            env BUILDX_NO_DEFAULT_LOAD="$no_load" BUILDKIT_PROGRESS=plain timeout --verbose --signal=TERM --kill-after=30s 10m python "$diag/build_overlay.py" --source-root "$GITHUB_WORKSPACE" --base-ref "$BASE_REF" --tag ovgw-e2e:local
             build_status=$?
             printf 'build_exit=%s\n' "$build_status"
             if (( build_status != 0 )); then return "$build_status"; fi
