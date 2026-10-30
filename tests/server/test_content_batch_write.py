@@ -1,6 +1,5 @@
 import asyncio
 import base64
-import hashlib
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -321,7 +320,8 @@ async def test_batch_coalesces_compile_target_updates(service, monkeypatch):
     root = "viking://resources/batch-metadata"
     store = service.compile.lifecycle.store
     await service.viking_fs.write_file(f"{root}/seed.md", "seed", ctx=ctx)
-    await store.register(ctx.account_id, root)
+    async with store.edit(ctx.account_id, root, create=True):
+        pass
     update_time = AsyncMock(wraps=store.mark_content_updated)
     monkeypatch.setattr(store, "mark_content_updated", update_time)
     ops = [{"uri": f"{root}/{i}.md", "content": "changed"} for i in range(100)]
@@ -900,7 +900,7 @@ async def test_batch_applies_operation_acl_and_forwards_file_options(
 
 
 @pytest.mark.asyncio
-async def test_batch_same_content_with_tags_is_not_skipped_as_a_conflict_noop(
+async def test_batch_same_content_applies_tags(
     monkeypatch,
     _coordinator_queue_for_unit_tests,
 ):
@@ -916,7 +916,6 @@ async def test_batch_same_content_with_tags_is_not_skipped_as_a_conflict_noop(
             {
                 "uri": uri,
                 "content": "same",
-                "expected_sha256": hashlib.sha256(b"same").hexdigest(),
                 "tags": ["team=search"],
             }
         ],
