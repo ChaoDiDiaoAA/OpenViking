@@ -250,29 +250,44 @@ def test_05_eviction_keeps_permanent_state_and_recovers_credentials(harness):
     ready = "ovgw:v1:k:{cap}:ready"
     harness.redis("HSET", permanent, "v", '{"name":"permanent"}', "rev", 1)
     harness.redis("SET", tombstone, 1)
-    harness.redis("CONFIG", "SET", "maxmemory", "30mb")
-    big = "retained context " * 8192
+    chat(harness, pods[0], "eviction-0", [{"role": "user", "content": "save before eviction"}])
 
-    def send(number):
-        return chat(
-            harness,
-            pods[number % 2],
-            f"eviction-{number}",
-            [{"role": "user", "content": f"{number}: {big}"}],
+    def redis_info(section):
+        return dict(
+            line.split(":", 1)
+            for line in harness.redis("INFO", section).splitlines()
+            if ":" in line
         )
 
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        list(executor.map(send, range(200)))
-    stats = dict(
-        line.split(":", 1) for line in harness.redis("INFO", "stats").splitlines() if ":" in line
-    )
-    assert int(stats["evicted_keys"]) > 0, stats
-    assert harness.redis("EXISTS", permanent) == "1"
-    assert harness.redis("EXISTS", tombstone) == "1"
-    assert harness.redis("TTL", permanent) == harness.redis("TTL", tombstone) == "-1"
-    assert harness.redis("EXISTS", ready) == "0"
-    chat(harness, pods[1], "eviction-0", [{"role": "user", "content": "continue after eviction"}])
-    harness.redis("CONFIG", "SET", "maxmemory", "96mb")
+    memory = redis_info("memory")
+    evicted_before = int(redis_info("stats")["evicted_keys"])
+    chunk_size = 256 * 1024
+    counted_memory = int(memory["used_memory"]) - int(memory["mem_not_counted_for_evict"])
+    pressure_keys = []
+    try:
+        # Response payloads need not occupy Redis memory after the Gateway saves a turn.
+        assert harness.redis("CONFIG", "SET", "maxmemory", counted_memory + 2 * chunk_size) == "OK"
+        for index in range(8):
+            key = f"e2e:eviction-pressure:{index}"
+            pressure_keys.append(key)
+            assert harness.redis("SET", key, "x", "EX", 300) == "OK"
+            assert harness.redis("SETRANGE", key, chunk_size - 1, "x") == str(chunk_size)
+            evicted_after = int(redis_info("stats")["evicted_keys"])
+            if evicted_after > evicted_before:
+                break
+
+        assert evicted_after > evicted_before, (evicted_before, evicted_after, redis_info("memory"))
+        assert harness.redis("EXISTS", permanent) == "1"
+        assert harness.redis("EXISTS", tombstone) == "1"
+        assert harness.redis("TTL", permanent) == harness.redis("TTL", tombstone) == "-1"
+        assert harness.redis("EXISTS", ready) == "0"
+        chat(
+            harness, pods[1], "eviction-0", [{"role": "user", "content": "continue after eviction"}]
+        )
+    finally:
+        harness.redis("CONFIG", "SET", "maxmemory", memory["maxmemory"])
+        if pressure_keys:
+            harness.redis("DEL", *pressure_keys)
     history = [{"role": "user", "content": "saved before key deletion"}]
     history.append(chat(harness, pods[0], "credential-rebuild", history))
     _, capture = session_keys(harness, "credential-rebuild")
