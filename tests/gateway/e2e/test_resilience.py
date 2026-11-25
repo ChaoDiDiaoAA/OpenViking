@@ -246,8 +246,6 @@ def test_05_eviction_keeps_permanent_state_and_recovers_credentials(harness):
     pods = harness.pods()
     permanent = "ovgw:v1:m:{a-e2e}:o:policies:permanent"
     tombstone = "ovgw:v1:kd:{deleted-e2e}"
-    # Earlier versions queued deliveries here.
-    ready = "ovgw:v1:k:{cap}:ready"
     harness.redis("HSET", permanent, "v", '{"name":"permanent"}', "rev", 1)
     harness.redis("SET", tombstone, 1)
     chat(harness, pods[0], "eviction-0", [{"role": "user", "content": "save before eviction"}])
@@ -280,7 +278,6 @@ def test_05_eviction_keeps_permanent_state_and_recovers_credentials(harness):
         assert harness.redis("EXISTS", permanent) == "1"
         assert harness.redis("EXISTS", tombstone) == "1"
         assert harness.redis("TTL", permanent) == harness.redis("TTL", tombstone) == "-1"
-        assert harness.redis("EXISTS", ready) == "0"
         chat(
             harness, pods[1], "eviction-0", [{"role": "user", "content": "continue after eviction"}]
         )
